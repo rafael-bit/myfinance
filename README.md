@@ -1,24 +1,24 @@
 <p align="center">
-   <img src="public/readme.jpg" alt="ClearCash" style="border-radius: 10px;" width="500"/>
+   <img src="public/readme.jpg" alt="MyFinance" style="border-radius: 10px;" width="500"/>
 </p>
 
 <h1 align="center">
-    <a href="https://github.com/rafael-bit/clearcash">ClearCash</a>
+    <a href="https://github.com/rafael-bit/myfinance">MyFinance</a>
 </h1>
 
 <p align="center">
-    ClearCash is a personal finance app to track expenses, manage budgets, and understand your money with clear insights.
+    MyFinance is a personal finance app to track expenses, manage budgets, and understand your money with clear insights.
 </p>
 
 <p align="center">
-  <a href="https://github.com/rafael-bit/clearcash">
-    <img src="https://img.shields.io/github/stars/rafael-bit/clearcash?label=rafael-bit%2Fclearcash" alt="ClearCash repository stars count" />
+  <a href="https://github.com/rafael-bit/myfinance">
+    <img src="https://img.shields.io/github/stars/rafael-bit/myfinance?label=rafael-bit%2Fmyfinance" alt="MyFinance repository stars count" />
   </a>
 </p>
 
 # 🚀 How It Works
 
-ClearCash helps you manage day-to-day money with double-entry accounting, category budgets, goals, cards, investments, and statement import. Data lives in Supabase with email/password auth; the UI is a React PWA with light and dark themes.
+MyFinance helps you manage day-to-day money with double-entry accounting, category budgets, goals, cards, investments, and statement import. Data lives in Supabase with email/password auth; the UI is a React PWA with light and dark themes.
 
 **Core ideas**
 - Transfers between your own accounts are not income or expense
@@ -32,8 +32,8 @@ ClearCash helps you manage day-to-day money with double-entry accounting, catego
 #### Clone the repository
 
 ```bash
-git clone https://github.com/rafael-bit/clearcash
-cd clearcash
+git clone https://github.com/rafael-bit/myfinance
+cd myfinance
 ```
 
 #### Install dependencies
@@ -116,4 +116,4 @@ Feel free to **report a new issue** with an appropriate title and description.
 
 # 🔧 Contributing
 
-Check the [contribution page](https://github.com/rafael-bit/clearcash/) to see the best places to report issues, start discussions, and contribute.
+Check the [contribution page](https://github.com/rafael-bit/myfinance/) to see the best places to report issues, start discussions, and contribute.
