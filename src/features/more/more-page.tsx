@@ -76,7 +76,7 @@ export function MorePage() {
     mutationFn: () =>
       service.createGoal({
         name: goalForm.name,
-        kind: "emergency",
+        kind: /emerg[eê]ncia/i.test(goalForm.name) ? "emergency" : "other",
         targetMajor: goalForm.target,
         currency: "BRL",
         targetDate: goalForm.date,

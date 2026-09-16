@@ -157,6 +157,64 @@ body {
   box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-border) 90%, transparent);
 }
 
+/* Fader vertical (mixer) — organização da renda */
+.org-volume-fader {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  -webkit-appearance: slider-vertical;
+  appearance: none;
+  width: 2.5rem;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  cursor: ns-resize;
+}
+
+.org-volume-fader::-webkit-slider-runnable-track {
+  width: 0.5rem;
+  height: 100%;
+  background: transparent;
+}
+
+.org-volume-fader::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 1.75rem;
+  height: 0.7rem;
+  margin-left: -0.625rem;
+  border-radius: 2px;
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+  box-shadow: 0 1px 2px color-mix(in oklab, var(--color-foreground) 12%, transparent);
+}
+
+.org-volume-fader::-moz-range-track {
+  width: 0.5rem;
+  background: transparent;
+}
+
+.org-volume-fader::-moz-range-thumb {
+  width: 1.75rem;
+  height: 0.7rem;
+  border-radius: 2px;
+  border: 1px solid var(--color-border);
+  background: var(--color-background);
+}
+
+.org-volume-fader:focus-visible {
+  outline: none;
+}
+
+.org-volume-fader:focus-visible::-webkit-slider-thumb {
+  border-color: var(--color-signal);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-signal) 22%, transparent);
+}
+
+.org-volume-fader:focus-visible::-moz-range-thumb {
+  border-color: var(--color-signal);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-signal) 22%, transparent);
+}
+
 .select-field {
   height: 2.75rem;
   width: 100%;

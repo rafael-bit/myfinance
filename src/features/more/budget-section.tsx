@@ -3,7 +3,6 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useFinance, useFinanceOptional } from "@/app/providers";
 import { Button } from "@/ui/button";
-import { Card } from "@/ui/card";
 import { Input } from "@/ui/input";
 import { Label } from "@/ui/label";
 import { MoneyText } from "@/ui/money-text";
@@ -15,6 +14,7 @@ import { addMonthsIso, monthKey, todayIsoDate } from "@/shared/dates";
 import { STANDING_BUDGET_MONTH } from "@/shared/constants";
 import type { BudgetAlert } from "@/domain/budget";
 import { cn } from "@/lib/utils";
+import { OrganizationSection } from "@/features/more/organization-section";
 
 const MONTH_LABEL = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric" });
 
@@ -226,6 +226,8 @@ export function BudgetSection() {
 
         <p className="max-w-xl text-sm leading-relaxed text-muted">{insight}</p>
       </div>
+
+      <OrganizationSection />
 
       <section className="space-y-3">
         <div>

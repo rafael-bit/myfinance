@@ -42,6 +42,18 @@ import {
   shiftYearMonth,
 } from "@/domain/budget";
 import {
+  allocateToCategories,
+  GROUP_LABEL,
+  REFERENCE_PERCENTS,
+  CONSUMPTION_GROUPS,
+  DEFAULT_EMERGENCY_MONTHS,
+  diagnoseCurrentDistribution,
+  recommendOrganization,
+  resolveCategoryGroup,
+  type AllocationGroup,
+  type ConsumptionGroup,
+} from "@/domain/organization";
+import {
   computeInvestorProfile,
   INVESTOR_QUESTIONS,
   type InvestorAnswer,
@@ -114,6 +126,14 @@ function normalizeMajorInput(raw: string): string {
     return cleaned.replace(/\./g, "").replace(",", ".");
   }
   return cleaned;
+}
+
+function normalizeCategoryLabel(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "");
 }
 
 function stamp(userId: string) {
@@ -403,6 +423,13 @@ export class FinanceService {
       aiEndpoint: map.aiEndpoint ?? "",
       aiKey: map.aiKey ?? "",
       brapiToken: map.brapiToken ?? "",
+      plannedIncomeMinor: map.planned_income_minor ? Number(map.planned_income_minor) : null,
+      plannedInvestmentMonthlyMinor: map.planned_investment_monthly_minor
+        ? Number(map.planned_investment_monthly_minor)
+        : null,
+      emergencyTargetMonths: map.emergency_target_months
+        ? Number(map.emergency_target_months)
+        : DEFAULT_EMERGENCY_MONTHS,
     };
   }
 
@@ -1812,13 +1839,268 @@ export class FinanceService {
     };
   }
 
+  /** Sugere a renda planejada a partir do último salário (categoria Salário). */
+  async suggestPlannedIncomeFromSalary() {
+    const categories = await this.listCategories();
+    const salaryCat = categories.find(
+      (c) => c.kind === "income" && normalizeCategoryLabel(c.name) === "salario",
+    );
+    const txns = await this.listTransactions({ from: monthKey(addMonthsIso(todayIsoDate(), -24)), to: todayIsoDate(), limit: 2000 });
+    const incomes = txns
+      .filter((t) => t.type === "income")
+      .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+
+    const fromSalary = salaryCat
+      ? incomes.find((t) => (t.categoryId ?? t.category_id) === salaryCat.id)
+      : undefined;
+    const last = fromSalary ?? incomes[0];
+    return {
+      suggestedMinor: last?.amountMinor ?? 0,
+      sourceDate: last?.date ?? null,
+      sourceLabel: fromSalary ? "Último salário" : last ? "Última receita" : null,
+      categoryId: salaryCat?.id ?? null,
+    };
+  }
+
+  async setPlannedIncome(amountMajor: string) {
+    const amount = fromMajor(normalizeMajorInput(amountMajor), DEFAULT_CURRENCY);
+    if (amount.amountMinor <= 0n) throw new Error("Informe uma renda maior que zero");
+    await this.saveSettings({ planned_income_minor: String(Number(amount.amountMinor)) });
+    return Number(amount.amountMinor);
+  }
+
+  async getCategoryGroupOverrides(): Promise<Record<string, ConsumptionGroup | null>> {
+    const userId = await this.userId();
+    const row = await firstRow(
+      this.client.from("settings").select("value").eq("user_id", userId).eq("key", "category_groups_json"),
+    );
+    if (!row?.value) return {};
+    try {
+      return JSON.parse(String(row.value)) as Record<string, ConsumptionGroup | null>;
+    } catch {
+      return {};
+    }
+  }
+
+  async setCategoryGroup(categoryId: string, group: ConsumptionGroup | null) {
+    const overrides = await this.getCategoryGroupOverrides();
+    overrides[categoryId] = group;
+    await this.saveSettings({ category_groups_json: JSON.stringify(overrides) });
+  }
+
+  /**
+   * Diagnóstico + recomendação de organização com base na renda planejada (salário).
+   */
+  async getOrganizationPlan(yearMonth?: string) {
+    const month = yearMonth || monthKey(todayIsoDate());
+    const settings = await this.getSettings();
+    const suggestion = await this.suggestPlannedIncomeFromSalary();
+    const plannedIncomeMinor = settings.plannedIncomeMinor;
+    const overrides = await this.getCategoryGroupOverrides();
+    const categories = await this.listCategories();
+    const expenseCats = categories.filter((c) => c.kind === "expense" && c.active);
+
+    const groupOf = (cat: { id: string; name: string }) =>
+      resolveCategoryGroup(cat.name, overrides[cat.id] !== undefined ? overrides[cat.id] : undefined);
+
+    const { start, end } = monthBounds(month);
+    const txns = await this.listTransactions({ from: start, to: end, limit: 2000 });
+    const spentByGroup: Partial<Record<ConsumptionGroup, number>> = {};
+    const weightByCat = new Map<string, number>();
+    for (const txn of txns.filter((t) => t.type === "expense")) {
+      const catId = txn.categoryId ?? txn.category_id;
+      if (!catId) continue;
+      weightByCat.set(catId, (weightByCat.get(catId) ?? 0) + txn.amountMinor);
+      const cat = expenseCats.find((c) => c.id === catId);
+      if (!cat) continue;
+      const g = groupOf(cat);
+      if (!g) continue;
+      spentByGroup[g] = (spentByGroup[g] ?? 0) + txn.amountMinor;
+    }
+
+    const goals = await this.listGoals();
+    const emergencyGoals = goals.filter((g) => g.kind === "emergency");
+    const personalGoals = goals.filter((g) => g.kind !== "emergency");
+    const currentReserveMinor = emergencyGoals.reduce((a, g) => a + g.currentMinor, 0);
+
+    // Aportes do mês em goals (aproximação: diferença não disponível; usa recommended como proxy 0)
+    // Contribuições do mês via query
+    const userId = await this.userId();
+    const contribs = await rows(
+      this.client
+        .from("goal_contributions")
+        .select("amount_minor, goal_id, date")
+        .eq("user_id", userId)
+        .gte("date", start)
+        .lte("date", end)
+        .is("deleted_at", null),
+    );
+    const emergencyIds = new Set(emergencyGoals.map((g) => g.id));
+    let goalsContributedMinor = 0;
+    let emergencyContributedMinor = 0;
+    for (const c of contribs) {
+      const amt = toNumber(c.amount_minor);
+      if (emergencyIds.has(String(c.goal_id))) emergencyContributedMinor += amt;
+      else goalsContributedMinor += amt;
+    }
+
+    // Investimentos: events contribution/buy no mês
+    const events = await rows(
+      this.client
+        .from("investment_events")
+        .select("amount_minor, type, date")
+        .eq("user_id", userId)
+        .gte("date", start)
+        .lte("date", end)
+        .is("deleted_at", null),
+    );
+    const investedMinor = events
+      .filter((e) => ["buy", "contribution"].includes(String(e.type)))
+      .reduce((a, e) => a + toNumber(e.amount_minor), 0);
+
+    const incomeForPlan = plannedIncomeMinor && plannedIncomeMinor > 0 ? plannedIncomeMinor : 0;
+    const observedFixed = spentByGroup.fixed ?? 0;
+
+    const recommendation = recommendOrganization({
+      incomeMinor: incomeForPlan,
+      observedFixedMinor: observedFixed,
+      currentReserveMinor,
+      targetMonths: settings.emergencyTargetMonths ?? DEFAULT_EMERGENCY_MONTHS,
+    });
+
+    const current = incomeForPlan
+      ? diagnoseCurrentDistribution({
+          incomeMinor: incomeForPlan,
+          spentByGroup,
+          goalsContributedMinor,
+          investedMinor,
+          emergencyContributedMinor,
+        })
+      : [];
+
+    const categoryMapping = expenseCats.map((c) => ({
+      id: c.id,
+      name: c.name,
+      group: groupOf(c),
+      color: c.color,
+    }));
+
+    return {
+      yearMonth: month,
+      plannedIncomeMinor,
+      salarySuggestion: suggestion,
+      categoryMapping,
+      current,
+      recommendation,
+      labels: GROUP_LABEL,
+      referencePercents: REFERENCE_PERCENTS,
+      personalGoals,
+      emergencyGoals,
+      weightsByCategory: Object.fromEntries(weightByCat),
+    };
+  }
+
+  /**
+   * Aplica a organização: limites de consumo → budgets;
+   * targets de invest/reserva; opcional snapshot do mês.
+   */
+  async applyOrganizationPlan(input: {
+    incomeMinor: number;
+    slices: { group: AllocationGroup; amountMinor: number }[];
+    yearMonth?: string;
+  }) {
+    if (input.incomeMinor <= 0) throw new Error("Informe a renda planejada");
+    const month = input.yearMonth || monthKey(todayIsoDate());
+    const overrides = await this.getCategoryGroupOverrides();
+    const categories = (await this.listCategories()).filter((c) => c.kind === "expense" && c.active);
+    const plan = await this.getOrganizationPlan(month);
+    const weights = plan.weightsByCategory as Record<string, number>;
+
+    const amountOf = (g: AllocationGroup) => input.slices.find((s) => s.group === g)?.amountMinor ?? 0;
+
+    for (const group of CONSUMPTION_GROUPS) {
+      const total = amountOf(group);
+      const cats = categories
+        .filter((c) => resolveCategoryGroup(c.name, overrides[c.id]) === group)
+        .map((c) => ({ id: c.id, weightMinor: weights[c.id] ?? 0 }));
+      const parts = allocateToCategories(total, cats);
+      for (const part of parts) {
+        if (part.limitMinor <= 0) continue;
+        await this.upsertBudget(
+          part.categoryId,
+          STANDING_BUDGET_MONTH,
+          (part.limitMinor / 100).toFixed(2).replace(".", ","),
+          DEFAULT_CURRENCY,
+        );
+      }
+    }
+
+    await this.saveSettings({
+      planned_income_minor: String(input.incomeMinor),
+      planned_investment_monthly_minor: String(amountOf("invest")),
+      planned_goals_monthly_minor: String(amountOf("goals")),
+      planned_emergency_monthly_minor: String(amountOf("emergency")),
+      allocation_plan_json: JSON.stringify({
+        appliedAt: nowIso(),
+        yearMonth: month,
+        incomeMinor: input.incomeMinor,
+        slices: input.slices,
+      }),
+    });
+
+    // Snapshot de limites para o mês (preserva histórico na análise futura)
+    const budgets = await this.listBudgets(month);
+    const snap: Record<string, number> = {};
+    for (const b of budgets.items) snap[b.categoryId] = b.limitMinor;
+    const userId = await this.userId();
+    const prevSnapRow = await firstRow(
+      this.client.from("settings").select("value").eq("user_id", userId).eq("key", "budget_snapshots_json"),
+    );
+    let allSnaps: Record<string, Record<string, number>> = {};
+    try {
+      allSnaps = prevSnapRow?.value ? JSON.parse(String(prevSnapRow.value)) : {};
+    } catch {
+      allSnaps = {};
+    }
+    allSnaps[month] = snap;
+    await this.saveSettings({ budget_snapshots_json: JSON.stringify(allSnaps) });
+
+    // Garante goal de reserva se houver aporte/alvo
+    const emergency = recommendOrganization({
+      incomeMinor: input.incomeMinor,
+      observedFixedMinor: amountOf("fixed"),
+      currentReserveMinor: plan.emergencyGoals.reduce((a, g) => a + g.currentMinor, 0),
+      targetMonths: (await this.getSettings()).emergencyTargetMonths ?? DEFAULT_EMERGENCY_MONTHS,
+    }).emergency;
+
+    if (emergency.targetReserveMinor > 0 && plan.emergencyGoals.length === 0) {
+      await this.createGoal({
+        name: "Reserva de emergência",
+        kind: "emergency",
+        targetMajor: (emergency.targetReserveMinor / 100).toFixed(2).replace(".", ","),
+        currency: DEFAULT_CURRENCY,
+        targetDate: `${Number(month.slice(0, 4)) + 2}-12-31`,
+      });
+    } else if (plan.emergencyGoals[0] && emergency.targetReserveMinor > plan.emergencyGoals[0].targetMinor) {
+      // atualiza alvo se maior — via update direto
+      await run(
+        this.client
+          .from("goals")
+          .update({ target_minor: emergency.targetReserveMinor, updated_at: nowIso() })
+          .eq("id", plan.emergencyGoals[0].id),
+      );
+    }
+
+    return { ok: true as const, yearMonth: month };
+  }
+
   async createGoal(input: { name: string; kind: string; targetMajor: string; currency: string; targetDate: string }) {
     const userId = await this.userId();
     const row = {
       ...stamp(userId),
       name: input.name,
       kind: input.kind,
-      target_minor: Number(fromMajor(input.targetMajor, input.currency).amountMinor),
+      target_minor: Number(fromMajor(normalizeMajorInput(input.targetMajor), input.currency).amountMinor),
       current_minor: 0,
       target_date: input.targetDate,
       linked_account_id: null,
