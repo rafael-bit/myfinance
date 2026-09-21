@@ -86,6 +86,13 @@ export function assertEmail(value: string): string {
   return email;
 }
 
+function appOrigin(): string {
+  const fromEnv = String(import.meta.env.VITE_APP_URL ?? "").trim().replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+  if (typeof window !== "undefined" && window.location?.origin) return window.location.origin;
+  return "https://omeufinanceiro.vercel.app";
+}
+
 export async function signUpWithPassword(
   client: SupabaseClient,
   params: { email: string; password: string; displayName?: string; currency?: string },
@@ -95,6 +102,7 @@ export async function signUpWithPassword(
     email,
     password: params.password,
     options: {
+      emailRedirectTo: `${appOrigin()}/`,
       data: {
         display_name: params.displayName?.trim() || email.split("@")[0],
         currency: params.currency ?? "BRL",

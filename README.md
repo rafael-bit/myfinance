@@ -53,6 +53,9 @@ cp .env.example .env.local
 **Required variables**
 - `VITE_SUPABASE_URL` — Supabase project URL (e.g. `https://xxxx.supabase.co`)
 - `VITE_SUPABASE_PUBLISHABLE_KEY` — Supabase publishable (anon) key
+- `VITE_APP_URL` — public app URL used in the email confirmation link (e.g. `https://omeufinanceiro.vercel.app`)
+
+In Supabase → Authentication → URL Configuration, set **Site URL** to the same value and add it under **Redirect URLs**.
 
 #### Apply the database schema
 
