@@ -2197,6 +2197,22 @@ export class FinanceService {
     return { id: row.id, name: input.name };
   }
 
+  async deleteProperty(propertyId: string) {
+    const userId = await this.userId();
+    const property = await firstRow(
+      this.client.from("properties").select("id").eq("id", propertyId).eq("user_id", userId).is("deleted_at", null),
+    );
+    if (!property) throw new Error("Bem não encontrado");
+    const at = nowIso();
+    await run(
+      this.client
+        .from("properties")
+        .update({ deleted_at: at, updated_at: at })
+        .eq("id", propertyId)
+        .eq("user_id", userId),
+    );
+  }
+
   async createLiability(input: {
     kind: string;
     name: string;
@@ -2224,6 +2240,38 @@ export class FinanceService {
     };
     await run(this.client.from("liabilities").insert(row));
     return { id: row.id, name: input.name, accountId: account.id };
+  }
+
+  async deleteLiability(liabilityId: string) {
+    const userId = await this.userId();
+    const liability = await firstRow(
+      this.client
+        .from("liabilities")
+        .select("id, account_id")
+        .eq("id", liabilityId)
+        .eq("user_id", userId)
+        .is("deleted_at", null),
+    );
+    if (!liability) throw new Error("Dívida não encontrada");
+    const at = nowIso();
+    await run(
+      this.client
+        .from("liabilities")
+        .update({ deleted_at: at, updated_at: at })
+        .eq("id", liabilityId)
+        .eq("user_id", userId),
+    );
+    const accountId = liability.account_id ? String(liability.account_id) : null;
+    if (accountId) {
+      await run(
+        this.client
+          .from("accounts")
+          .update({ deleted_at: at, updated_at: at, status: "closed", include_in_net_worth: 0 })
+          .eq("id", accountId)
+          .eq("user_id", userId)
+          .is("deleted_at", null),
+      );
+    }
   }
 
   async listNetWorthItems() {

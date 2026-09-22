@@ -49,6 +49,9 @@ export function MorePage() {
   const [contributeGoal, setContributeGoal] = useState<{ id: string; name: string; suggested: string } | null>(null);
   const [contributeAmount, setContributeAmount] = useState("");
   const [deleteGoalId, setDeleteGoalId] = useState<{ id: string; name: string } | null>(null);
+  const [deleteWealth, setDeleteWealth] = useState<
+    { kind: "property" | "liability"; id: string; name: string } | null
+  >(null);
 
   const { start } = useGuide();
   const contribute = useMutation({
@@ -68,6 +71,17 @@ export function MorePage() {
       toast.success("Meta apagada");
       bump();
       setDeleteGoalId(null);
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
+  const removeWealth = useMutation({
+    mutationFn: (item: { kind: "property" | "liability"; id: string }) =>
+      item.kind === "property" ? service.deleteProperty(item.id) : service.deleteLiability(item.id),
+    onSuccess: (_data, item) => {
+      toast.success(item.kind === "property" ? "Bem removido" : "Dívida removida");
+      bump();
+      setDeleteWealth(null);
     },
     onError: (e) => toast.error(e.message),
   });
@@ -225,17 +239,46 @@ export function MorePage() {
                 <h2 className="font-display mt-1 text-3xl leading-none">Patrimônio</h2>
               </div>
               {nw.data?.properties.map((p) => (
-                <Card key={p.id} className="flex justify-between gap-3 p-4">
-                  <span className="font-medium">{p.name}</span>
-                  <MoneyText amountMinor={p.currentValueMinor} className="text-xl" />
+                <Card key={p.id} className="flex items-center justify-between gap-3 p-4">
+                  <div className="min-w-0">
+                    <p className="font-medium">{p.name}</p>
+                    <p className="text-xs text-muted">Bem</p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <MoneyText amountMinor={p.currentValueMinor} className="text-xl" />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="text-danger"
+                      onClick={() => setDeleteWealth({ kind: "property", id: p.id, name: p.name })}
+                    >
+                      Remover
+                    </Button>
+                  </div>
                 </Card>
               ))}
               {nw.data?.liabilities.map((l) => (
-                <Card key={l.id} className="flex justify-between gap-3 p-4">
-                  <span className="font-medium">{l.name}</span>
-                  <MoneyText amountMinor={l.principalMinor} signed className="text-xl" />
+                <Card key={l.id} className="flex items-center justify-between gap-3 p-4">
+                  <div className="min-w-0">
+                    <p className="font-medium">{l.name}</p>
+                    <p className="text-xs text-muted">Dívida</p>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <MoneyText amountMinor={l.principalMinor} signed className="text-xl" />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="text-danger"
+                      onClick={() => setDeleteWealth({ kind: "liability", id: l.id, name: l.name })}
+                    >
+                      Remover
+                    </Button>
+                  </div>
                 </Card>
               ))}
+              {!nw.data?.properties.length && !nw.data?.liabilities.length ? (
+                <p className="text-sm text-muted">Nenhum bem ou dívida cadastrado.</p>
+              ) : null}
               <div className="flex flex-wrap gap-2">
                 <Button
                   variant="secondary"
@@ -550,6 +593,24 @@ export function MorePage() {
         danger
         onConfirm={() => {
           if (deleteGoalId) removeGoal.mutate(deleteGoalId.id);
+        }}
+      />
+
+      <ConfirmDialog
+        open={Boolean(deleteWealth)}
+        onOpenChange={(open) => !open && setDeleteWealth(null)}
+        title={deleteWealth?.kind === "liability" ? "Remover dívida?" : "Remover bem?"}
+        description={
+          deleteWealth
+            ? deleteWealth.kind === "liability"
+              ? `A dívida "${deleteWealth.name}" sai do patrimônio.`
+              : `O bem "${deleteWealth.name}" sai do patrimônio.`
+            : undefined
+        }
+        confirmLabel="Remover"
+        danger
+        onConfirm={() => {
+          if (deleteWealth) removeWealth.mutate(deleteWealth);
         }}
       />
     </div>
