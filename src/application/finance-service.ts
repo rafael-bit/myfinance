@@ -16,7 +16,7 @@ import { createId } from "@/shared/ids";
 import { jsonStringify } from "@/shared/json";
 import { nowIso, todayIsoDate, monthKey, monthBounds, addDaysIso, addMonthsIso } from "@/shared/dates";
 import { BACKUP_VERSION, DEFAULT_CURRENCY, STANDING_BUDGET_MONTH } from "@/shared/constants";
-import { DEFAULT_WIDGETS } from "@/infra/db/seeds";
+import { CATEGORY_SEEDS, DEFAULT_WIDGETS } from "@/infra/db/seeds";
 import {
   accountBalance,
   assertBalanced,
@@ -480,27 +480,114 @@ export class FinanceService {
     let list = await rows(
       this.client.from("categories").select("*").eq("user_id", userId).is("deleted_at", null).order("kind"),
     );
-    const hasPersonal = list.some(
-      (row) => String(row.kind) === "expense" && String(row.name).toLowerCase() === "despesas pessoais",
-    );
-    if (!hasPersonal) {
-      const row = {
-        ...stamp(userId),
-        name: "Despesas pessoais",
-        kind: "expense",
-        parent_id: null,
-        icon: "user",
-        color: "#7c2d12",
-        active: 1,
-        system: 1,
-      };
-      await run(this.client.from("categories").insert(row));
-      list = await rows(
-        this.client.from("categories").select("*").eq("user_id", userId).is("deleted_at", null).order("kind"),
-      );
-    }
+    list = await this.dedupeCategoriesByName(userId, list);
+    list = await this.ensureSeedCategories(userId, list);
+    // Segunda passagem: cobre corrida se várias telas listarem categorias ao mesmo tempo.
+    list = await this.dedupeCategoriesByName(userId, list);
     list = await this.mergeAlimentacaoComprasIntoMercado(userId, list);
     return list.map(mapCategory);
+  }
+
+  /** Remove categorias repetidas (mesmo tipo + nome + pai), preservando lançamentos. */
+  private async dedupeCategoriesByName(userId: string, list: DbRow[]) {
+    const groups = new Map<string, DbRow[]>();
+    for (const row of list) {
+      const key = [
+        String(row.kind ?? "expense"),
+        normalizeCategoryLabel(String(row.name ?? "")),
+        String(row.parent_id ?? ""),
+      ].join("|");
+      const bucket = groups.get(key) ?? [];
+      bucket.push(row);
+      groups.set(key, bucket);
+    }
+
+    let changed = false;
+    const at = nowIso();
+    for (const [, bucket] of groups) {
+      if (bucket.length < 2) continue;
+      changed = true;
+      bucket.sort((a, b) => {
+        const activeDiff = toNumber(b.active, 1) - toNumber(a.active, 1);
+        if (activeDiff !== 0) return activeDiff;
+        const systemDiff = toNumber(b.system) - toNumber(a.system);
+        if (systemDiff !== 0) return systemDiff;
+        return String(a.created_at ?? "").localeCompare(String(b.created_at ?? ""));
+      });
+      const keep = bucket[0]!;
+      const keepId = String(keep.id);
+      for (const dup of bucket.slice(1)) {
+        const sourceId = String(dup.id);
+        await run(
+          this.client
+            .from("transactions")
+            .update({ category_id: keepId, updated_at: at })
+            .eq("user_id", userId)
+            .eq("category_id", sourceId)
+            .is("deleted_at", null),
+        );
+        await run(
+          this.client
+            .from("categorization_rules")
+            .update({ category_id: keepId, updated_at: at })
+            .eq("user_id", userId)
+            .eq("category_id", sourceId)
+            .is("deleted_at", null),
+        );
+        await this.repointBudgetsToCategory(userId, sourceId, keepId, at);
+        await run(
+          this.client
+            .from("categories")
+            .update({ parent_id: keepId, updated_at: at })
+            .eq("user_id", userId)
+            .eq("parent_id", sourceId)
+            .is("deleted_at", null),
+        );
+        await run(
+          this.client
+            .from("categories")
+            .update({ deleted_at: at, updated_at: at, active: 0 })
+            .eq("id", sourceId)
+            .eq("user_id", userId),
+        );
+      }
+    }
+
+    if (!changed) return list;
+    return rows(
+      this.client.from("categories").select("*").eq("user_id", userId).is("deleted_at", null).order("kind"),
+    );
+  }
+
+  /** Completa seeds faltantes sem recriar nomes que já existem. */
+  private async ensureSeedCategories(userId: string, list: DbRow[]) {
+    const existing = new Set(
+      list
+        .filter((row) => !row.parent_id)
+        .map((row) => `${String(row.kind)}|${normalizeCategoryLabel(String(row.name ?? ""))}`),
+    );
+    const missing = CATEGORY_SEEDS.filter(
+      (seed) => !existing.has(`${seed.kind}|${normalizeCategoryLabel(seed.name)}`),
+    );
+    if (missing.length === 0) return list;
+
+    const at = nowIso();
+    const inserts = missing.map((seed) => ({
+      ...stamp(userId),
+      created_at: at,
+      updated_at: at,
+      name: seed.name,
+      kind: seed.kind,
+      parent_id: null,
+      icon: seed.icon,
+      color: seed.color,
+      active: 1,
+      system: 1,
+    }));
+    await run(this.client.from("categories").insert(inserts));
+    return rows(
+      this.client.from("categories").select("*").eq("user_id", userId).is("deleted_at", null).order("kind"),
+    );
   }
 
   /**
@@ -648,11 +735,28 @@ export class FinanceService {
 
   async createCategory(input: { name: string; kind: string; parentId?: string; icon?: string; color?: string }) {
     const userId = await this.userId();
+    const name = input.name.trim();
+    if (!name) throw new Error("Informe um nome para a categoria");
+    const existing = await rows(
+      this.client
+        .from("categories")
+        .select("id, name, parent_id")
+        .eq("user_id", userId)
+        .eq("kind", input.kind)
+        .is("deleted_at", null),
+    );
+    const parentId = input.parentId ?? null;
+    const duplicate = existing.find(
+      (row) =>
+        normalizeCategoryLabel(String(row.name ?? "")) === normalizeCategoryLabel(name) &&
+        String(row.parent_id ?? "") === String(parentId ?? ""),
+    );
+    if (duplicate) throw new Error("Já existe uma categoria com esse nome");
     const row = {
       ...stamp(userId),
-      name: input.name,
+      name,
       kind: input.kind,
-      parent_id: input.parentId ?? null,
+      parent_id: parentId,
       icon: input.icon ?? null,
       color: input.color ?? null,
       active: 1,

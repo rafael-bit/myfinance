@@ -87,6 +87,34 @@ create table if not exists public.categories (
   system integer not null default 0
 );
 
+-- Limpa duplicatas ativas (mesmo usuário/tipo/nome/pai) antes do índice único.
+with ranked as (
+  select
+    id,
+    row_number() over (
+      partition by user_id, kind, lower(name), coalesce(parent_id, '')
+      order by system desc, active desc, created_at asc, id asc
+    ) as rn
+  from public.categories
+  where deleted_at is null
+)
+update public.categories c
+set deleted_at = to_char(timezone('utc', now()), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+    updated_at = to_char(timezone('utc', now()), 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+    active = 0
+from ranked r
+where c.id = r.id and r.rn > 1;
+
+-- Evita categorias ativas com o mesmo nome no mesmo nível (pai).
+create unique index if not exists categories_user_kind_name_parent_alive_uidx
+  on public.categories (
+    user_id,
+    kind,
+    lower(name),
+    coalesce(parent_id, '')
+  )
+  where deleted_at is null;
+
 create table if not exists public.tags (
   id text primary key,
   user_id uuid not null references auth.users(id) on delete cascade,
