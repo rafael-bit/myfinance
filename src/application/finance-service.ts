@@ -65,8 +65,10 @@ import {
   applyRules,
   detectDuplicates,
   detectImportSource,
+  isGenericRulePattern,
   learnRule,
   parseCsv,
+  suggestExpenseCategoryKind,
   parseOfx,
   parsePdfText,
 } from "@/domain/import/parse";
@@ -484,8 +486,166 @@ export class FinanceService {
     list = await this.ensureSeedCategories(userId, list);
     // Segunda passagem: cobre corrida se várias telas listarem categorias ao mesmo tempo.
     list = await this.dedupeCategoriesByName(userId, list);
+    list = await this.flattenSeedCategoryParents(userId, list);
     list = await this.mergeAlimentacaoComprasIntoMercado(userId, list);
+    await this.purgeGenericCategorizationRules(userId);
+    list = await this.repointBudgetsToAliveCategories(userId, list);
+    await this.reconcileExpenseCategoriesByDescription(userId, list);
+    await this.clearIncomeCategoriesOnExpenses(userId, list);
     return list.map(mapCategory);
+  }
+
+  /** Despesas marcadas com categoria de receita (ex.: Outras receitas) → Outras despesas / sem categoria. */
+  private async clearIncomeCategoriesOnExpenses(userId: string, list: DbRow[]) {
+    const incomeIds = list.filter((row) => String(row.kind) === "income").map((row) => String(row.id));
+    if (!incomeIds.length) return;
+    const outrasDespesas = list.find(
+      (row) =>
+        String(row.kind) === "expense" &&
+        !row.parent_id &&
+        normalizeCategoryLabel(String(row.name ?? "")) === "outras despesas",
+    );
+    const targetId = outrasDespesas ? String(outrasDespesas.id) : null;
+    const at = nowIso();
+    for (const incomeId of incomeIds) {
+      const patch = targetId
+        ? { category_id: targetId, updated_at: at }
+        : { category_id: null, updated_at: at };
+      await run(
+        this.client
+          .from("transactions")
+          .update(patch)
+          .eq("user_id", userId)
+          .eq("type", "expense")
+          .eq("category_id", incomeId)
+          .is("deleted_at", null),
+      );
+    }
+  }
+
+  /** Orçamento apontando para categoria apagada → categoria viva com o mesmo nome. */
+  private async repointBudgetsToAliveCategories(userId: string, list: DbRow[]) {
+    const aliveByName = new Map(
+      list
+        .filter((row) => String(row.kind) === "expense")
+        .map((row) => [normalizeCategoryLabel(String(row.name ?? "")), String(row.id)] as const),
+    );
+    const budgetRows = await rows(this.client.from("budgets").select("*").eq("user_id", userId));
+    const aliveIds = new Set(list.map((row) => String(row.id)));
+    const at = nowIso();
+    for (const budget of budgetRows) {
+      const catId = String(budget.category_id);
+      if (aliveIds.has(catId)) continue;
+      const dead = await firstRow(
+        this.client.from("categories").select("name, kind").eq("id", catId).eq("user_id", userId),
+      );
+      if (!dead || String(dead.kind) !== "expense") continue;
+      const targetId = aliveByName.get(normalizeCategoryLabel(String(dead.name ?? "")));
+      if (!targetId || targetId === catId) continue;
+      await this.repointBudgetsToCategory(userId, catId, targetId, at);
+      await run(
+        this.client
+          .from("transactions")
+          .update({ category_id: targetId, updated_at: at })
+          .eq("user_id", userId)
+          .eq("category_id", catId)
+          .is("deleted_at", null),
+      );
+    }
+    return list;
+  }
+
+  /** Seeds de topo não podem ficar aninhadas (ex.: Mercado filho de Contas). */
+  private async flattenSeedCategoryParents(userId: string, list: DbRow[]) {
+    const seedNames = new Set(CATEGORY_SEEDS.map((seed) => normalizeCategoryLabel(seed.name)));
+    const nestedSeeds = list.filter(
+      (row) =>
+        row.parent_id &&
+        seedNames.has(normalizeCategoryLabel(String(row.name ?? ""))) &&
+        String(row.kind) === "expense",
+    );
+    if (!nestedSeeds.length) return list;
+    const at = nowIso();
+    for (const row of nestedSeeds) {
+      await run(
+        this.client
+          .from("categories")
+          .update({ parent_id: null, updated_at: at })
+          .eq("id", String(row.id))
+          .eq("user_id", userId),
+      );
+    }
+    return rows(
+      this.client.from("categories").select("*").eq("user_id", userId).is("deleted_at", null).order("kind"),
+    );
+  }
+
+  /** Remove regras curtas/genéricas que jogam tudo numa categoria (ex.: "MERCADO" → Contas). */
+  private async purgeGenericCategorizationRules(userId: string) {
+    const ruleRows = await rows(
+      this.client.from("categorization_rules").select("id, pattern").eq("user_id", userId).is("deleted_at", null),
+    );
+    const at = nowIso();
+    for (const row of ruleRows) {
+      if (!isGenericRulePattern(String(row.pattern ?? ""))) continue;
+      await run(
+        this.client
+          .from("categorization_rules")
+          .update({ deleted_at: at, updated_at: at })
+          .eq("id", String(row.id))
+          .eq("user_id", userId),
+      );
+    }
+  }
+
+  /**
+   * Recategoriza despesas pela descrição (Mercado ↔ Contas), incluindo
+   * lançamentos ligados a categorias já apagadas/duplicadas.
+   */
+  private async reconcileExpenseCategoriesByDescription(userId: string, list: DbRow[]) {
+    const seedId = (seed: "mercado" | "contas") =>
+      list.find(
+        (row) =>
+          String(row.kind) === "expense" &&
+          !row.parent_id &&
+          normalizeCategoryLabel(String(row.name ?? "")) === seed,
+      )?.id;
+
+    const mercadoId = seedId("mercado");
+    const contasId = seedId("contas");
+    if (!mercadoId && !contasId) return;
+
+    const from = monthKey(addMonthsIso(todayIsoDate(), -18));
+    const { start } = monthBounds(from);
+    const candidates = await rows(
+      this.client
+        .from("transactions")
+        .select("id, description, category_id")
+        .eq("user_id", userId)
+        .eq("type", "expense")
+        .gte("date", start)
+        .is("deleted_at", null)
+        .limit(5000),
+    );
+    if (!candidates.length) return;
+
+    const at = nowIso();
+    for (const row of candidates) {
+      const hint = suggestExpenseCategoryKind(String(row.description ?? ""));
+      if (!hint) continue;
+      const targetId = hint === "mercado" ? mercadoId : contasId;
+      if (!targetId) continue;
+      const currentId = row.category_id ? String(row.category_id) : "";
+      if (currentId === targetId) continue;
+      // Padaria/supermercado → sempre Mercado; contas de consumo → Contas
+      await run(
+        this.client
+          .from("transactions")
+          .update({ category_id: targetId, updated_at: at })
+          .eq("id", String(row.id))
+          .eq("user_id", userId),
+      );
+    }
   }
 
   /** Remove categorias repetidas (mesmo tipo + nome + pai), preservando lançamentos. */
@@ -928,14 +1088,18 @@ export class FinanceService {
     );
   }
 
-  async listTransactions(params?: { from?: string; to?: string; limit?: number }) {
+  async listTransactions(params?: { from?: string; to?: string; limit?: number; offset?: number }) {
     const userId = await this.userId();
     const limit = params?.limit ?? 200;
+    const offset = Math.max(0, params?.offset ?? 0);
     const base = this.client.from("transactions").select("*").eq("user_id", userId).is("deleted_at", null);
     const withFrom = params?.from ? base.gte("date", params.from) : base;
     const withTo = params?.to ? withFrom.lte("date", params.to) : withFrom;
     const txnRows = await rows(
-      withTo.order("date", { ascending: false }).order("created_at", { ascending: false }).limit(limit),
+      withTo
+        .order("date", { ascending: false })
+        .order("created_at", { ascending: false })
+        .range(offset, offset + limit - 1),
     );
     const ids = txnRows.map((row) => String(row.id));
     const postingRows = await this.postingsFor(userId, ids);
@@ -951,6 +1115,9 @@ export class FinanceService {
           currency: String(posting.currency ?? DEFAULT_CURRENCY),
         }));
       const primary = legs.find((leg) => leg.accountId === txn.account_id);
+      const amountMinor = primary
+        ? Math.abs(primary.amountMinor)
+        : Math.max(0, ...legs.map((leg) => Math.abs(leg.amountMinor)));
       return {
         id: String(txn.id),
         type: String(txn.type),
@@ -971,10 +1138,72 @@ export class FinanceService {
         cardId: (txn.card_id ?? null) as string | null,
         invoiceId: (txn.invoice_id ?? null) as string | null,
         externalId: (txn.external_id ?? null) as string | null,
-        amountMinor: primary ? Math.abs(primary.amountMinor) : 0,
+        amountMinor,
         postings: legs,
       };
     });
+  }
+
+  /** Todas as despesas do intervalo (paginado) — base do orçamento = mesmo extrato. */
+  private async listAllExpenses(from: string, to: string) {
+    const pageSize = 1000;
+    const all: Awaited<ReturnType<FinanceService["listTransactions"]>> = [];
+    let offset = 0;
+    for (;;) {
+      const page = await this.listTransactions({ from, to, limit: pageSize, offset });
+      const expenses = page.filter((txn) => txn.type === "expense");
+      all.push(...expenses);
+      if (page.length < pageSize) break;
+      offset += pageSize;
+      if (offset > 50_000) break;
+    }
+    return all;
+  }
+
+  private async buildAliveCategoryResolver(
+    userId: string,
+    alive: { id: string; name: string; parentId: string | null; kind?: string }[],
+    opts?: { kind?: "expense" | "income" },
+  ) {
+    const kind = opts?.kind ?? "expense";
+    const scoped = alive.filter((c) => !c.kind || c.kind === kind);
+    const aliveById = new Map(scoped.map((c) => [c.id, c]));
+    const aliveByName = new Map(
+      scoped.map((c) => [normalizeCategoryLabel(c.name), c.id] as const),
+    );
+    const allCats = await rows(
+      this.client.from("categories").select("id, name, parent_id, kind, deleted_at").eq("user_id", userId),
+    );
+    const resolve = (categoryId: string | null | undefined): string | null => {
+      if (!categoryId) return null;
+      // Despesa com categoria de receita (ex.: Outras receitas) não entra no orçamento
+      const raw = allCats.find((row) => String(row.id) === categoryId);
+      if (raw && String(raw.kind ?? "") !== kind) return null;
+      if (aliveById.has(categoryId)) return this.rootCategoryId(categoryId, aliveById);
+      if (!raw) return null;
+      const byName = aliveByName.get(normalizeCategoryLabel(String(raw.name ?? "")));
+      return byName ? this.rootCategoryId(byName, aliveById) : null;
+    };
+    return resolve;
+  }
+
+  private rootCategoryId(
+    categoryId: string | null | undefined,
+    catMap: Map<string, { id: string; parentId: string | null; name?: string }>,
+  ): string | null {
+    if (!categoryId) return null;
+    const seedNames = new Set(CATEGORY_SEEDS.map((seed) => normalizeCategoryLabel(seed.name)));
+    let current = categoryId;
+    const seen = new Set<string>();
+    while (catMap.has(current) && !seen.has(current)) {
+      seen.add(current);
+      const node = catMap.get(current)!;
+      const parentId = node.parentId;
+      if (seedNames.has(normalizeCategoryLabel(String(node.name ?? "")))) return current;
+      if (!parentId || !catMap.has(parentId)) return current;
+      current = parentId;
+    }
+    return catMap.has(current) ? current : null;
   }
 
   /** PostgREST sends filters in the URL, so long id lists have to be chunked. */
@@ -1069,7 +1298,12 @@ export class FinanceService {
       patch.date = input.date;
       patch.competency_date = input.date;
     }
-    if (input.categoryId !== undefined) patch.category_id = input.categoryId;
+    if (input.categoryId !== undefined) {
+      if (type === "expense" || type === "income") {
+        await this.assertCategoryMatchesType(input.categoryId, type);
+      }
+      patch.category_id = input.categoryId;
+    }
     if (input.notes !== undefined) patch.notes = input.notes;
 
     let accountId = String(txn.account_id);
@@ -1166,6 +1400,27 @@ export class FinanceService {
     await run(this.client.from("transactions").update(patch).eq("id", transactionId).eq("user_id", userId));
   }
 
+  private async assertCategoryMatchesType(categoryId: string | null | undefined, type: "expense" | "income") {
+    if (!categoryId) return;
+    const userId = await this.userId();
+    const cat = await firstRow(
+      this.client
+        .from("categories")
+        .select("id, kind, name")
+        .eq("id", categoryId)
+        .eq("user_id", userId)
+        .is("deleted_at", null),
+    );
+    if (!cat) throw new Error("Categoria não encontrada");
+    if (String(cat.kind) !== type) {
+      throw new Error(
+        type === "expense"
+          ? `A categoria "${String(cat.name)}" é de receita e não pode ser usada em despesa`
+          : `A categoria "${String(cat.name)}" é de despesa e não pode ser usada em receita`,
+      );
+    }
+  }
+
   async registerExpense(input: {
     amountMajor: string;
     currency: string;
@@ -1182,6 +1437,7 @@ export class FinanceService {
     idempotencyKey?: string;
   }) {
     const userId = await this.userId();
+    await this.assertCategoryMatchesType(input.categoryId, "expense");
     const amount = fromMajor(input.amountMajor, input.currency);
     if (input.installments && input.installments > 1) {
       return this.createInstallments({ ...input, amount, installments: input.installments });
@@ -1219,6 +1475,7 @@ export class FinanceService {
     idempotencyKey?: string;
   }) {
     const userId = await this.userId();
+    await this.assertCategoryMatchesType(input.categoryId, "income");
     return this.commitDraft(
       buildIncome({
         amount: fromMajor(input.amountMajor, input.currency),
@@ -1693,19 +1950,30 @@ export class FinanceService {
     }
     const userId = await this.userId();
     const { start, end } = monthBounds(yearMonth);
-    const [txns, categories, budgetRows] = await Promise.all([
-      this.listTransactions({ from: start, to: end, limit: 500 }),
-      this.listCategories(),
+    // Categorias primeiro: reconcilia padaria/mercado no banco antes de somar.
+    const categories = await this.listCategories();
+    const [txns, budgetRows] = await Promise.all([
+      this.listAllExpenses(start, end),
       this.loadStandingBudgetRows(userId),
     ]);
-    const catMap = new Map(categories.map((c) => [c.id, c]));
+    const expenseCategories = categories.filter((c) => c.kind === "expense");
+    const catMap = new Map(expenseCategories.map((c) => [c.id, c]));
+    const resolveCategory = await this.buildAliveCategoryResolver(userId, expenseCategories, { kind: "expense" });
+    const mercadoId =
+      expenseCategories.find((c) => !c.parentId && normalizeCategoryLabel(c.name) === "mercado")?.id ?? null;
+    const contasId =
+      expenseCategories.find((c) => !c.parentId && normalizeCategoryLabel(c.name) === "contas")?.id ?? null;
     const standingByCat = new Map(budgetRows.map((row) => [String(row.category_id), toNumber(row.limit_minor)]));
     const spentMap = new Map<string, number>();
-    for (const txn of txns.filter((item) => item.type === "expense")) {
-      const key = txn.categoryId ?? txn.category_id ?? "uncategorized";
+    for (const txn of txns) {
+      const hint = suggestExpenseCategoryKind(String(txn.description ?? ""));
+      const hintedId = hint === "mercado" ? mercadoId : hint === "contas" ? contasId : null;
+      const rawId = txn.categoryId ?? txn.category_id ?? null;
+      const rootId = hintedId ?? resolveCategory(rawId);
+      const key = rootId ?? "uncategorized";
       spentMap.set(key, (spentMap.get(key) ?? 0) + txn.amountMinor);
     }
-    const totalSpentMinor = [...spentMap.values()].reduce((a, b) => a + b, 0);
+    const totalSpentMinor = txns.reduce((a, txn) => a + txn.amountMinor, 0);
     const pace = monthElapsedPercent(yearMonth);
     const ranked = [...spentMap.entries()]
       .map(([categoryId, spentMinor]) => {
@@ -1734,6 +2002,48 @@ export class FinanceService {
       .sort((a, b) => b.spentMinor - a.spentMinor);
 
     return { yearMonth, totalSpentMinor, categories: ranked, pace };
+  }
+
+  /** Detalha despesas de uma categoria no mês (mesma regra do orçamento: hint + categoria). */
+  async listCategoryExpenses(yearMonth: string, categoryId: string | null) {
+    const userId = await this.userId();
+    const categories = await this.listCategories();
+    const { start, end } = monthBounds(yearMonth);
+    const txns = await this.listAllExpenses(start, end);
+    const expenseCategories = categories.filter((c) => c.kind === "expense");
+    const resolveCategory = await this.buildAliveCategoryResolver(userId, expenseCategories, { kind: "expense" });
+    const mercadoId =
+      expenseCategories.find((c) => !c.parentId && normalizeCategoryLabel(c.name) === "mercado")?.id ?? null;
+    const contasId =
+      expenseCategories.find((c) => !c.parentId && normalizeCategoryLabel(c.name) === "contas")?.id ?? null;
+    const catName =
+      categoryId == null
+        ? "Sem categoria"
+        : expenseCategories.find((c) => c.id === categoryId)?.name ?? "Categoria";
+
+    const items = txns
+      .filter((txn) => {
+        const hint = suggestExpenseCategoryKind(String(txn.description ?? ""));
+        const hintedId = hint === "mercado" ? mercadoId : hint === "contas" ? contasId : null;
+        const rootId = hintedId ?? resolveCategory(txn.categoryId ?? txn.category_id);
+        if (categoryId == null) return !rootId;
+        return rootId === categoryId;
+      })
+      .map((txn) => ({
+        id: txn.id,
+        date: txn.date,
+        description: txn.description,
+        amountMinor: txn.amountMinor,
+      }))
+      .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : b.amountMinor - a.amountMinor));
+
+    return {
+      yearMonth,
+      categoryId,
+      categoryName: catName,
+      totalMinor: items.reduce((a, item) => a + item.amountMinor, 0),
+      items,
+    };
   }
 
   /**
@@ -1829,9 +2139,8 @@ export class FinanceService {
     const spentByMonth = new Map<string, bigint>();
     if (from > prevEnd) return spentByMonth;
 
-    const txns = await this.listTransactions({ from, to: prevEnd, limit: 5000 });
+    const txns = await this.listAllExpenses(from, prevEnd);
     for (const txn of txns) {
-      if (txn.type !== "expense") continue;
       const ym = monthKey(txn.date);
       if (ym >= yearMonth) continue;
       spentByMonth.set(ym, (spentByMonth.get(ym) ?? 0n) + BigInt(txn.amountMinor));
@@ -1860,6 +2169,8 @@ export class FinanceService {
           alert: "ok" | "near" | "reached" | "over";
           pace: "under" | "on_track" | "ahead";
         }[],
+        spentTotalMinor: 0,
+        unbudgetedMinor: 0,
         envelope: null as null | {
           standingTotalMinor: number;
           availableTotalMinor: number;
@@ -1872,21 +2183,44 @@ export class FinanceService {
       };
     }
     const userId = await this.userId();
-    const [budgetRows, categories, historySpend] = await Promise.all([
-      this.loadStandingBudgetRows(userId),
-      this.listCategories(),
-      this.loadTotalSpendByMonth(yearMonth),
-    ]);
-    const catMap = new Map(categories.map((c) => [c.id, c]));
     const { start, end } = monthBounds(yearMonth);
-    const txns = await this.listTransactions({ from: start, to: end, limit: 500 });
+    // Categorias primeiro: reconcilia padaria/mercado no banco antes de somar.
+    const categories = await this.listCategories();
+    const [budgetRows, historySpend, txns] = await Promise.all([
+      this.loadStandingBudgetRows(userId),
+      this.loadTotalSpendByMonth(yearMonth),
+      this.listAllExpenses(start, end),
+    ]);
+    const expenseCategories = categories.filter((c) => c.kind === "expense");
+    const catMap = new Map(expenseCategories.map((c) => [c.id, c]));
+    const resolveCategory = await this.buildAliveCategoryResolver(userId, expenseCategories, { kind: "expense" });
+    const mercadoId =
+      expenseCategories.find((c) => !c.parentId && normalizeCategoryLabel(c.name) === "mercado")?.id ?? null;
+    const contasId =
+      expenseCategories.find((c) => !c.parentId && normalizeCategoryLabel(c.name) === "contas")?.id ?? null;
     const pace = monthElapsedPercent(yearMonth);
     const historyFrom = shiftYearMonth(yearMonth, -36);
 
     const standingTotalMinor = budgetRows.reduce((acc, row) => acc + toNumber(row.limit_minor), 0);
-    const spentTotalMinor = txns
-      .filter((txn) => txn.type === "expense")
-      .reduce((acc, txn) => acc + txn.amountMinor, 0);
+    const spentTotalMinor = txns.reduce((acc, txn) => acc + txn.amountMinor, 0);
+
+    const spentByRoot = new Map<string, number>();
+    let unbudgetedMinor = 0;
+    const budgetedIds = new Set(
+      budgetRows.map((row) => resolveCategory(String(row.category_id)) ?? String(row.category_id)),
+    );
+    for (const txn of txns) {
+      const hint = suggestExpenseCategoryKind(String(txn.description ?? ""));
+      const hintedId = hint === "mercado" ? mercadoId : hint === "contas" ? contasId : null;
+      const rootId = hintedId ?? resolveCategory(txn.categoryId ?? txn.category_id);
+      if (!rootId) {
+        unbudgetedMinor += txn.amountMinor;
+        continue;
+      }
+      // Soma sempre por categoria (mesmo sem meta) — evita padaria “sumir” do Mercado
+      spentByRoot.set(rootId, (spentByRoot.get(rootId) ?? 0) + txn.amountMinor);
+      if (!budgetedIds.has(rootId)) unbudgetedMinor += txn.amountMinor;
+    }
 
     const envelopeEffective =
       standingTotalMinor > 0
@@ -1904,12 +2238,11 @@ export class FinanceService {
         : null;
 
     const items = budgetRows.map((row) => {
-      const categoryId = String(row.category_id);
+      const rawCategoryId = String(row.category_id);
+      const categoryId = resolveCategory(rawCategoryId) ?? rawCategoryId;
       const cat = catMap.get(categoryId);
       const standingLimitMinor = toNumber(row.limit_minor);
-      const spentMinor = txns
-        .filter((txn) => txn.type === "expense" && (txn.categoryId ?? txn.category_id) === categoryId)
-        .reduce((acc, txn) => acc + txn.amountMinor, 0);
+      const spentMinor = spentByRoot.get(categoryId) ?? 0;
       const usage = budgetUsage(BigInt(spentMinor), BigInt(standingLimitMinor));
       return {
         id: String(row.id),
@@ -1926,8 +2259,31 @@ export class FinanceService {
       };
     });
 
+    // Garante Mercado nas metas se houve gasto (padaria etc.) e ainda não existe limite
+    if (mercadoId && (spentByRoot.get(mercadoId) ?? 0) > 0 && !items.some((item) => item.categoryId === mercadoId)) {
+      const spentMinor = spentByRoot.get(mercadoId) ?? 0;
+      const cat = catMap.get(mercadoId);
+      const usage = budgetUsage(BigInt(spentMinor), 0n);
+      items.push({
+        id: `virtual-mercado-${mercadoId}`,
+        categoryId: mercadoId,
+        categoryName: cat?.name ?? "Mercado",
+        categoryColor: cat?.color ?? null,
+        yearMonth: STANDING_BUDGET_MONTH,
+        standingLimitMinor: 0,
+        limitMinor: 0,
+        spentMinor,
+        ...usage,
+        pace: budgetPace(usage.percent, pace.elapsedPercent),
+        remainingMinor: Number(usage.remainingMinor),
+      });
+      unbudgetedMinor = Math.max(0, unbudgetedMinor - spentMinor);
+    }
+
     return {
       items,
+      spentTotalMinor,
+      unbudgetedMinor,
       envelope:
         envelopeUsage && envelopeEffective
           ? {
@@ -2654,9 +3010,10 @@ export class FinanceService {
             })()
           : parseCsv(text);
 
-    const [existing, ruleRows] = await Promise.all([
+    const [existing, ruleRows, categories] = await Promise.all([
       this.listTransactions({ limit: 2000 }),
       rows(this.client.from("categorization_rules").select("*").eq("user_id", userId).is("deleted_at", null)),
+      this.listCategories(),
     ]);
     const existingMovements = existing.map((txn) => ({
       date: txn.date,
@@ -2670,10 +3027,19 @@ export class FinanceService {
       matchType: String(row.match_type ?? "contains") as "contains",
       categoryId: String(row.category_id),
     }));
+    const categoryIdBySeed = (seed: "mercado" | "contas") =>
+      categories.find(
+        (c) => c.kind === "expense" && c.active && !c.parentId && normalizeCategoryLabel(c.name) === seed,
+      )?.id;
 
     const items = parsed.map((item, index) => {
       const duplicates = detectDuplicates(item, existingMovements);
       const rule = applyRules(item.description, rules);
+      let categoryId = rule?.categoryId;
+      if (!categoryId && item.type === "expense") {
+        const hint = suggestExpenseCategoryKind(item.description);
+        if (hint) categoryId = categoryIdBySeed(hint);
+      }
       return {
         id: item.externalId ?? `row-${index}`,
         date: item.date,
@@ -2682,7 +3048,7 @@ export class FinanceService {
         type: item.type,
         externalId: item.externalId,
         duplicate: Boolean(duplicates[0]),
-        categoryId: rule?.categoryId,
+        categoryId,
         decision: duplicates[0] ? ("skip" as const) : ("accept" as const),
         toAccountId: undefined as string | undefined,
       };
@@ -2714,6 +3080,8 @@ export class FinanceService {
       file_name: meta?.fileName ?? "import",
     };
     await run(this.client.from("import_jobs").insert(job));
+    const categories = await this.listCategories();
+    const kindByCat = new Map(categories.map((c) => [c.id, c.kind]));
 
     let accepted = 0;
     let skipped = 0;
@@ -2754,6 +3122,15 @@ export class FinanceService {
         idempotencyKey,
       };
 
+      const isIncome = item.type === "income" || (item.type !== "expense" && item.type !== "transfer" && signed > 0n);
+      let categoryId = item.categoryId;
+      if (categoryId) {
+        const catKind = kindByCat.get(categoryId);
+        if (item.type === "transfer") categoryId = undefined;
+        else if (isIncome && catKind !== "income") categoryId = undefined;
+        else if (!isIncome && catKind !== "expense") categoryId = undefined;
+      }
+
       if (item.type === "transfer") {
         if (!item.toAccountId) throw new Error(`Informe a outra conta da transferência: ${item.description}`);
         if (signed < 0n) {
@@ -2761,25 +3138,27 @@ export class FinanceService {
         } else {
           await this.registerTransfer({ ...common, fromAccountId: item.toAccountId, toAccountId: accountId });
         }
-      } else if (item.type === "income" || (item.type !== "expense" && signed > 0n)) {
-        await this.registerIncome({ ...common, accountId, categoryId: item.categoryId });
+      } else if (isIncome) {
+        await this.registerIncome({ ...common, accountId, categoryId });
       } else {
-        await this.registerExpense({ ...common, accountId, categoryId: item.categoryId });
+        await this.registerExpense({ ...common, accountId, categoryId });
       }
       accepted += 1;
 
-      if (item.categoryId) {
-        const rule = learnRule(item.description, item.categoryId);
-        await run(
-          this.client.from("categorization_rules").insert({
-            ...stamp(userId),
-            pattern: rule.pattern,
-            match_type: rule.matchType,
-            category_id: rule.categoryId,
-            priority: 0,
-            learned_from: "import",
-          }),
-        );
+      if (categoryId) {
+        const rule = learnRule(item.description, categoryId);
+        if (rule) {
+          await run(
+            this.client.from("categorization_rules").insert({
+              ...stamp(userId),
+              pattern: rule.pattern,
+              match_type: rule.matchType,
+              category_id: rule.categoryId,
+              priority: 0,
+              learned_from: "import",
+            }),
+          );
+        }
       }
     }
     return { jobId: job.id, accepted, skipped };

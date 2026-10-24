@@ -225,23 +225,16 @@ export function QuickAdd({ open, onOpenChange }: { open: boolean; onOpenChange: 
     },
 
     onSuccess: () => {
-
-      toast.success("Lançamento salvo");
-
+      const [y, m, d] = date.split("-");
+      const brDate = y && m && d ? `${d}/${m}/${y}` : date;
+      toast.success(`Lançamento salvo · ${brDate} — abra Finanças nesse mês`);
       bump();
-
       onOpenChange(false);
-
       setAmount("");
-
       setDescription("");
-
       setPaymentMode("account");
-
       setCardId("");
-
       setInstallments("1");
-
     },
 
     onError: (err) => toast.error(err.message),

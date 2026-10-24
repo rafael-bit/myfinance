@@ -11,6 +11,14 @@ import { MoneyText } from "@/ui/money-text";
 import { EmptyState, Skeleton } from "@/ui/empty-state";
 import { PageTitle } from "@/ui/page-title";
 import { Sheet } from "@/ui/sheet";
+import { addMonthsIso, monthBounds, monthKey, todayIsoDate } from "@/shared/dates";
+
+const MONTH_LABEL = new Intl.DateTimeFormat("pt-BR", { month: "long", year: "numeric" });
+
+function formatMonthTitle(yearMonth: string) {
+  const label = MONTH_LABEL.format(new Date(`${yearMonth}-01T12:00:00`));
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
 
 const TYPE_LABEL: Record<string, string> = {
   expense: "Despesa",
@@ -50,7 +58,13 @@ function formatMinorBrl(minor: number) {
 export function ActivityPage() {
   const service = useFinance();
   const { bump } = useFinanceOptional();
-  const txns = useQuery({ queryKey: ["txns"], queryFn: () => service.listTransactions({ limit: 80 }) });
+  const [yearMonth, setYearMonth] = useState(() => monthKey(todayIsoDate()));
+  const { start, end } = useMemo(() => monthBounds(yearMonth), [yearMonth]);
+
+  const txns = useQuery({
+    queryKey: ["txns", yearMonth],
+    queryFn: () => service.listTransactions({ from: start, to: end, limit: 500 }),
+  });
   const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => service.listAccounts() });
   const categories = useQuery({ queryKey: ["categories"], queryFn: () => service.listCategories() });
   const cards = useQuery({ queryKey: ["cards"], queryFn: () => service.listCards() });
@@ -172,11 +186,34 @@ export function ActivityPage() {
         </aside>
 
         <section className="min-w-0 space-y-3">
-          <h2 className="font-display text-xl">Movimentações</h2>
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <h2 className="font-display text-xl">Movimentações</h2>
+            <div className="flex items-center gap-1 border border-border p-1">
+              <Button
+                size="sm"
+                variant="ghost"
+                className="min-h-9 px-3"
+                onClick={() => setYearMonth(monthKey(addMonthsIso(`${yearMonth}-01`, -1)))}
+                aria-label="Mês anterior"
+              >
+                ←
+              </Button>
+              <span className="min-w-34 text-center text-sm font-medium">{formatMonthTitle(yearMonth)}</span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="min-h-9 px-3"
+                onClick={() => setYearMonth(monthKey(addMonthsIso(`${yearMonth}-01`, 1)))}
+                aria-label="Próximo mês"
+              >
+                →
+              </Button>
+            </div>
+          </div>
           {txns.data?.length === 0 ? (
             <EmptyState
-              title="Nada lançado ainda"
-              description="Adicione a primeira despesa, receita ou transferência pelo botão +."
+              title={`Nada em ${formatMonthTitle(yearMonth).toLowerCase()}`}
+              description="Troque o mês acima ou lance pelo botão +. Lançamentos antigos ficam no mês da data."
             />
           ) : (
             <ul className="space-y-2">
@@ -187,6 +224,11 @@ export function ActivityPage() {
                       <p className="truncate text-sm font-medium">{txn.description}</p>
                       <p className="truncate text-xs text-muted">
                         {TYPE_LABEL[txn.type] ?? txn.type} · {txn.date}
+                        {txn.categoryId
+                          ? ` · ${categories.data?.find((c) => c.id === txn.categoryId)?.name ?? "Categoria"}`
+                          : txn.type === "expense" || txn.type === "income"
+                            ? " · Sem categoria"
+                            : ""}
                         {txn.installment_number ? ` · ${txn.installment_number}x` : ""}
                       </p>
                     </div>

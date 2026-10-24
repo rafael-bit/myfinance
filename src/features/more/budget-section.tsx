@@ -23,10 +23,6 @@ function formatMonthTitle(yearMonth: string) {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
-function previousMonthKey() {
-  return monthKey(addMonthsIso(todayIsoDate(), -1));
-}
-
 function alertLabel(alert: BudgetAlert) {
   if (alert === "over") return "Estourou a meta";
   if (alert === "reached") return "No teto da meta";
@@ -49,12 +45,13 @@ function barFill(alert: BudgetAlert | null | undefined, color: string | null) {
 export function BudgetSection() {
   const service = useFinance();
   const { bump } = useFinanceOptional();
-  const [yearMonth, setYearMonth] = useState(previousMonthKey);
+  const [yearMonth, setYearMonth] = useState(() => monthKey(todayIsoDate()));
   const [sheetOpen, setSheetOpen] = useState(false);
   const [categoryId, setCategoryId] = useState("");
   const [limit, setLimit] = useState("");
   const [editingBudgetId, setEditingBudgetId] = useState<string | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
+  const [detailCategory, setDetailCategory] = useState<{ id: string | null; name: string } | null>(null);
 
   const currentMonth = monthKey(todayIsoDate());
   const isClosedMonth = yearMonth < currentMonth;
@@ -68,6 +65,11 @@ export function BudgetSection() {
     queryFn: () => service.listBudgets(yearMonth),
   });
   const cats = useQuery({ queryKey: ["categories"], queryFn: () => service.listCategories() });
+  const categoryDetail = useQuery({
+    queryKey: ["category-expenses", yearMonth, detailCategory?.id ?? "none"],
+    queryFn: () => service.listCategoryExpenses(yearMonth, detailCategory!.id),
+    enabled: Boolean(detailCategory),
+  });
 
   const expenseCats = useMemo(
     () => cats.data?.filter((c) => c.kind === "expense" && c.active) ?? [],
@@ -82,7 +84,10 @@ export function BudgetSection() {
   const standingTotal = envelope?.standingTotalMinor ?? budgetItems.reduce((a, b) => a + b.limitMinor, 0);
   const availableTotal = envelope?.availableTotalMinor ?? standingTotal;
   const debtTotal = envelope?.debtMinor ?? 0;
-  const spentTotal = envelope?.spentTotalMinor ?? spend.data?.totalSpentMinor ?? 0;
+  const spentTotal =
+    budgets.data?.spentTotalMinor ?? envelope?.spentTotalMinor ?? spend.data?.totalSpentMinor ?? 0;
+  const unbudgetedMinor = budgets.data?.unbudgetedMinor ?? 0;
+  const budgetedSpentMinor = budgetItems.reduce((a, b) => a + b.spentMinor, 0);
   const overCount = budgetItems.filter((b) => b.alert === "over" || b.alert === "reached").length;
   const underCount = budgetItems.filter((b) => b.alert === "ok" && b.percent < 80).length;
 
@@ -179,7 +184,10 @@ export function BudgetSection() {
               {isClosedMonth ? "Análise · gasto no mês fechado" : "Análise · gasto deste mês"}
             </p>
             <p className="mt-2">
-              <Amount amountMinor={spend.data?.totalSpentMinor ?? 0} size="hero" className="text-4xl md:text-5xl" />
+              <Amount amountMinor={spentTotal} size="hero" className="text-4xl md:text-5xl" />
+            </p>
+            <p className="mt-1 text-xs text-muted">
+              Soma das despesas de {formatMonthTitle(yearMonth).toLowerCase()} — igual ao extrato desse mês
             </p>
           </div>
           <div className="max-w-xs text-right text-sm">
@@ -189,6 +197,17 @@ export function BudgetSection() {
               Meta por categoria não muda. Se o total de gastos passar do teto, o excesso reduz o disponível total no mês
               seguinte.
             </p>
+            {budgetItems.length ? (
+              <p className="mt-2 text-xs text-muted">
+                Nas metas: <MoneyText amountMinor={budgetedSpentMinor} className="text-xs" />
+                {unbudgetedMinor > 0 ? (
+                  <>
+                    {" "}
+                    · fora das metas: <MoneyText amountMinor={unbudgetedMinor} className="text-xs" />
+                  </>
+                ) : null}
+              </p>
+            ) : null}
           </div>
         </div>
 
@@ -246,7 +265,11 @@ export function BudgetSection() {
               const width = Math.max(6, (row.spentMinor / maxSpent) * 100);
               return (
                 <li key={row.categoryId ?? `uncat-${index}`} className="py-4">
-                  <div className="flex items-start justify-between gap-3">
+                  <button
+                    type="button"
+                    className="flex w-full items-start justify-between gap-3 text-left"
+                    onClick={() => setDetailCategory({ id: row.categoryId, name: row.name })}
+                  >
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <span
@@ -262,7 +285,7 @@ export function BudgetSection() {
                       </p>
                     </div>
                     <MoneyText amountMinor={row.spentMinor} className="shrink-0 text-xl" />
-                  </div>
+                  </button>
                   <div className="mt-2.5 h-1 overflow-hidden bg-foreground/[0.06]">
                     <div
                       className="h-full transition-[width] duration-[var(--dur-data)] ease-[var(--ease-out)]"
@@ -311,7 +334,7 @@ export function BudgetSection() {
           <ul className="divide-y divide-border border-t border-border">
             {budgetItems
               .slice()
-              .sort((a, b) => b.percent - a.percent)
+              .sort((a, b) => b.spentMinor - a.spentMinor || b.percent - a.percent)
               .map((b) => (
                 <li key={b.id} className="py-4">
                   <div className="flex items-start justify-between gap-3">
@@ -402,6 +425,41 @@ export function BudgetSection() {
               </Button>
             ) : null}
           </div>
+        </div>
+      </Sheet>
+
+      <Sheet
+        open={Boolean(detailCategory)}
+        onOpenChange={(open) => !open && setDetailCategory(null)}
+        title={detailCategory ? detailCategory.name : "Detalhe"}
+      >
+        <div className="space-y-4 pb-4">
+          <div>
+            <p className="kicker">{formatMonthTitle(yearMonth)}</p>
+            <p className="mt-1">
+              <Amount amountMinor={categoryDetail.data?.totalMinor ?? 0} size="lg" className="text-3xl" />
+            </p>
+            <p className="mt-1 text-xs text-muted">
+              {categoryDetail.data?.items.length ?? 0} lançamento(s)
+            </p>
+          </div>
+          {categoryDetail.isLoading ? (
+            <p className="text-sm text-muted">Carregando…</p>
+          ) : !categoryDetail.data?.items.length ? (
+            <p className="text-sm text-muted">Nenhum lançamento nesta categoria neste mês.</p>
+          ) : (
+            <ul className="divide-y divide-border border-t border-border">
+              {categoryDetail.data.items.map((item) => (
+                <li key={item.id} className="flex items-start justify-between gap-3 py-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium">{item.description}</p>
+                    <p className="text-xs text-muted">{item.date}</p>
+                  </div>
+                  <MoneyText amountMinor={item.amountMinor} className="shrink-0 text-base" />
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </Sheet>
 

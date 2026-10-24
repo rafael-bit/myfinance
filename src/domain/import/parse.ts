@@ -31,11 +31,93 @@ export function normalizeDescription(value: string): string {
     .trim();
 }
 
+/** Tokens genéricos demais para virar regra (geram falsos positivos). */
+const GENERIC_RULE_TOKENS = new Set([
+  "PIX",
+  "TED",
+  "DOC",
+  "PAG",
+  "PAGAMENTO",
+  "COMPRA",
+  "DEBITO",
+  "CREDITO",
+  "CARTAO",
+  "VISA",
+  "MASTER",
+  "ELO",
+  "LOJA",
+  "PGTO",
+  "PAGTO",
+  "TRANSFER",
+  "TRANSFERENCIA",
+  "ENVIO",
+  "RECEBIDO",
+  "RECEBIMENTO",
+  "QR",
+  "CODE",
+  "MP",
+  "MERCADO", // sozinho pega Mercado Pago + supermercado
+  "PAGO",
+  "LIVRE",
+]);
+
+const GROCERY_HINT =
+  /\b(SUPERMERCADO|HIPERMERCADO|ATACADAO|ATACADO|ASSAI|CARREFOUR|PAO DE ACUCAR|SAMS|MAKRO|HORTIFRUTI|HORTI|PADARIA|PANIFICADORA|CONFEITARIA|PADARIAE|ACOUGUE|IFOOD|RAPPI|ZE DELIVERY|MERCADINHO|MINIMERCADO|BOM PRECO|BOMPRECO|SAVEGNAGO|NAGUMO|COSTA ATACADO|TENDA|SONDA|SPAANI|GOODBOM|MUFFATO|ROLDAO|FESTIVAL|KOWALSKI|GIGA|ATACADISTA|MERCEARIA|EMPORIO|ADEGA|SACOLAO|HORTIFRUT|CASA DO PAO|CASA DO PAO)\b/;
+
+const NOT_GROCERY_HINT =
+  /\b(MERCADO PAGO|MERCADOPAGO|MERCPAGO|MERCADO LIVRE|MERCADOLIVRE|MELI|UBER|99APP|PICPAY)\b/;
+
+const BILLS_HINT =
+  /\b(ENERGIA|CELPE|CEMIG|ENEL|CPFL|LIGHT|COPEL|SABESP|COMPESA|SANEAMENTO|GAS NATURAL|COMGAS|INTERNET|VIVO FIBRA|CLARO NET|OI FIBRA|CONDOMINIO|IPTU|IPVA|SEGURO RESIDENCIAL|ALUGUEL|CONTAS DE LUZ|CONTAS DE AGUA|DAE\b|DMAE|COPASA|CEEE|CELESC)\b/;
+
+export function isGenericRulePattern(pattern: string): boolean {
+  const normalized = normalizeDescription(pattern);
+  if (!normalized) return true;
+  if (NOT_GROCERY_HINT.test(normalized)) return true;
+  const tokens = normalized.split(" ").filter(Boolean);
+  if (tokens.length === 0) return true;
+  if (tokens.length === 1) {
+    const token = tokens[0]!;
+    if (token.length < 4) return true;
+    if (GENERIC_RULE_TOKENS.has(token)) return true;
+  }
+  // "MERCADO PAGO ..." continua genérico demais para aprender
+  if (tokens[0] === "MERCADO" && (tokens[1] === "PAGO" || tokens[1] === "LIVRE")) return true;
+  // Meios de pagamento no início não são assinatura de estabelecimento
+  if (tokens[0] && GENERIC_RULE_TOKENS.has(tokens[0])) return true;
+  return false;
+}
+
+/** Sugestão por descrição (sem regras salvas). */
+export function suggestExpenseCategoryKind(
+  description: string,
+): "mercado" | "contas" | null {
+  const normalized = normalizeDescription(description);
+  if (!normalized) return null;
+  if (NOT_GROCERY_HINT.test(normalized)) {
+    // Mercado Pago + supermercado no mesmo texto → ainda é mercado
+    if (GROCERY_HINT.test(normalized)) return "mercado";
+    return null;
+  }
+  if (GROCERY_HINT.test(normalized)) return "mercado";
+  // "MERCADO X" / "SUPER ..." que não é Pago/Livre costuma ser supermercado
+  if (/\bMERCADO\b/.test(normalized) && !NOT_GROCERY_HINT.test(normalized)) return "mercado";
+  if (/\bSUPER\b/.test(normalized) && !/\bSUPERMARKET APP\b/.test(normalized)) return "mercado";
+  if (/\bEXTRA\b/.test(normalized) && !/\bEXTRAORDIN/.test(normalized)) return "mercado";
+  // Padaria / pão (abreviações comuns no extrato)
+  if (/\bPADARIA\b|\bPANIFIC|\bCONFEIT|\bPAD\b|\bPAO\b|\bPÃO\b/.test(normalized)) return "mercado";
+  if (BILLS_HINT.test(normalized)) return "contas";
+  return null;
+}
+
 export function applyRules(description: string, rules: CategorizationRule[]): CategorizationRule | undefined {
   const normalized = normalizeDescription(description);
-  const sorted = [...rules].sort((a, b) => b.pattern.length - a.pattern.length);
+  const sorted = [...rules]
+    .filter((rule) => !isGenericRulePattern(rule.pattern))
+    .sort((a, b) => b.pattern.length - a.pattern.length);
   return sorted.find((rule) => {
     const pattern = normalizeDescription(rule.pattern);
+    if (!pattern || pattern.length < 4) return false;
     if (rule.matchType === "exact") return normalized === pattern;
     if (rule.matchType === "contains") return normalized.includes(pattern);
     try {
@@ -46,9 +128,17 @@ export function applyRules(description: string, rules: CategorizationRule[]): Ca
   });
 }
 
-export function learnRule(description: string, categoryId: string): CategorizationRule {
-  const token = normalizeDescription(description).split(" ")[0] ?? description;
-  return { pattern: token, matchType: "contains", categoryId };
+export function learnRule(description: string, categoryId: string): CategorizationRule | null {
+  const tokens = normalizeDescription(description).split(" ").filter(Boolean);
+  if (tokens.length === 0) return null;
+
+  // Prefere 2–3 tokens distintivos; evita 1ª palavra genérica sozinha.
+  let pattern = tokens.slice(0, Math.min(3, tokens.length)).join(" ");
+  if (isGenericRulePattern(pattern) && tokens.length > 1) {
+    pattern = tokens.slice(0, Math.min(4, tokens.length)).join(" ");
+  }
+  if (isGenericRulePattern(pattern)) return null;
+  return { pattern, matchType: "contains", categoryId };
 }
 
 export function detectDuplicates(
